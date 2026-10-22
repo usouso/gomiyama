@@ -136,7 +136,7 @@
     s.pile = draw(s, plan.size);
     s.draft = { order: plan.order, step: 0, pPicks: plan.pPicks, oPicks: plan.oPicks };
     s.phase = 'draft';
-    ev.push({ t: 'pile', cards: s.pile.slice() });
+    ev.push({ t: 'pile', cards: s.pile.slice(), order: plan.order.slice() });
     runOpp(s, ev);
   }
 
