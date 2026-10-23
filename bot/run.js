@@ -5,7 +5,7 @@
 const R = require('../src/rules.js');
 const AI = require('../src/ai.js');
 const S = require('./strategies.js');
-R.setOppPicker(AI.pick);
+AI.install();
 
 const N = parseInt(process.argv[2] || '300', 10);
 // 3 つ目の引数で数値を上書きできる（調整用）。例: node bot/run.js 300 '{"rares":[[30,2],[40,2],[55,3]]}'
@@ -61,11 +61,11 @@ function playOne(strategy, keep, seed) {
     }
   }
   if (s.phase === 'win') { beaten[2] = true; turnsPerRare[2] = s.turn - lastTurnMark; }
-  return { win: s.phase === 'win', reached, beaten, turns: s.turn, hp: s.player.hp, turnsPerRare, owned: s.player.owned.length, dmg: s.totalDmg, hpAt, picks, oppPicks, playedCards };
+  return { win: s.phase === 'win', reached, beaten, turns: s.turn, hp: s.player.hp, turnsPerRare, owned: s.player.owned.length, dmg: s.totalDmg, hpAt, picks, oppPicks, playedCards, oppDmg: s.oppCardDmg, oppTurns: s.oppTurns, oppFixed: s.oppFixedDmg, oppStone: s.oppStoneDmg, heal: s.playerHeal, blocked: s.playerBlocked };
 }
 
 function runConfig(strategy, keep, n, seedBase) {
-  const agg = { reached: [0, 0, 0], beaten: [0, 0, 0], wins: 0, turns: 0, hpWin: 0, turnsPerRare: [0, 0, 0], beatCount: [0, 0, 0], dmg: 0, hpAt: [0, 0, 0], picks: {}, oppPicks: {}, playedCards: {} };
+  const agg = { reached: [0, 0, 0], beaten: [0, 0, 0], wins: 0, turns: 0, hpWin: 0, turnsPerRare: [0, 0, 0], beatCount: [0, 0, 0], dmg: 0, hpAt: [0, 0, 0], picks: {}, oppPicks: {}, playedCards: {}, oppDmg: 0, oppTurns: 0 };
   const addTo = (dst, src) => Object.keys(src).forEach(k => { dst[k] = (dst[k] || 0) + src[k]; });
   for (let i = 0; i < n; i++) {
     const r = playOne(strategy, keep, seedBase + i);
@@ -75,7 +75,8 @@ function runConfig(strategy, keep, n, seedBase) {
       if (r.beaten[k]) { agg.beaten[k]++; agg.turnsPerRare[k] += r.turnsPerRare[k]; agg.beatCount[k]++; }
     }
     if (r.win) { agg.wins++; agg.hpWin += r.hp; }
-    agg.turns += r.turns; agg.dmg += r.dmg;
+    agg.turns += r.turns; agg.dmg += r.dmg; agg.oppDmg += r.oppDmg; agg.oppTurns += r.oppTurns;
+    agg.oppFixed = (agg.oppFixed || 0) + r.oppFixed; agg.oppStone = (agg.oppStone || 0) + r.oppStone; agg.heal = (agg.heal || 0) + r.heal; agg.blocked = (agg.blocked || 0) + r.blocked;
   }
   return agg;
 }
@@ -96,18 +97,22 @@ const configs = [
   { no: '5-4b', st: S.combo, keep: 'second' },
   { no: '(1 取る)', st: S.random, keep: true },
   { no: '(3 取る)', st: S.greedy, keep: true },
-  { no: '(3 1枚目だけ)', st: S.greedy, keep: 'first' }
+  { no: '(3 1枚目だけ)', st: S.greedy, keep: 'first' },
+  { no: '(3 2枚目だけ)', st: S.greedy, keep: 'second' }
 ];
 
+module.exports = { playOne, runConfig, pct };
+if (require.main === module) main();
+function main() {
 const COMPACT = !!(OV && OV.compact);
 console.log('各 ' + N + ' 回。「倒した」= ' + N + ' 回のうちレア k を倒した割合（レア3 を倒した = 旅の勝ち）。「到達して倒した」= レア k に着いた回のうち倒した割合。');
 console.log('');
 if (COMPACT) {
-  console.log('| 番号 | 取り方・出し方 | レア | 1 | 2 | 3 | 着いた時の体力 2/3 | ターン 1/2/3 | dmg/T |');
-  console.log('|---|---|---|---|---|---|---|---|---|');
+  console.log('| 番号 | 取り方・出し方 | レア | 1 | 2 | 3 | 着いた時の体力 2/3 | ターン 1/2/3 | dmg/T | 相手の札 dmg/T |');
+  console.log('|---|---|---|---|---|---|---|---|---|---|');
 } else {
-  console.log('| 番号 | 取り方・出し方 | レア | レア1 倒した | レア2 倒した | レア3 倒した（＝旅の勝率） | レア2 到達して倒した | レア3 到達して倒した | 着いたときの体力（レア2 / レア3） | 倒すのにかかったターン（1/2/3） | 平均ターン | 1 ターンの平均ダメージ |');
-  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|');
+  console.log('| 番号 | 取り方・出し方 | レア | レア1 倒した | レア2 倒した | レア3 倒した（＝旅の勝率） | レア2 到達して倒した | レア3 到達して倒した | 着いたときの体力（レア2 / レア3） | 倒すのにかかったターン（1/2/3） | 平均ターン | 自分の 1 ターンの平均ダメージ | 相手が札で出した 1 ターンの平均ダメージ |');
+  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|---|');
 }
 const breakdown = [];
 function dist(o) {
@@ -119,12 +124,13 @@ for (const c of configs) {
   if (c.keep === false) breakdown.push({ c, a });
   const tpr = a.turnsPerRare.map((t, k) => a.beatCount[k] ? (t / a.beatCount[k]).toFixed(1) : '-').join(' / ');
   const hpAt = [1, 2].map(k => a.reached[k] ? (a.hpAt[k] / a.reached[k]).toFixed(0) : '-').join(' / ');
+  const oppD = a.oppTurns ? (a.oppDmg / a.oppTurns).toFixed(1) : '-';
   if (COMPACT) {
-    console.log('| ' + c.no + ' | ' + c.st.name + ' | ' + KEEP_JP[c.keep] + ' | ' + pct(a.beaten[0], N) + ' | ' + pct(a.beaten[1], N) + ' | ' + pct(a.beaten[2], N) + ' | ' + hpAt + ' | ' + tpr + ' | ' + (a.dmg / a.turns).toFixed(1) + ' |');
+    console.log('| ' + c.no + ' | ' + c.st.name + ' | ' + KEEP_JP[c.keep] + ' | ' + pct(a.beaten[0], N) + ' | ' + pct(a.beaten[1], N) + ' | ' + pct(a.beaten[2], N) + ' | ' + hpAt + ' | ' + tpr + ' | ' + (a.dmg / a.turns).toFixed(1) + ' | ' + oppD + ' |');
   } else {
     console.log('| ' + c.no + ' | ' + c.st.name + ' | ' + KEEP_JP[c.keep] + ' | ' +
       pct(a.beaten[0], N) + ' | ' + pct(a.beaten[1], N) + ' | ' + pct(a.beaten[2], N) + ' | ' +
-      pct(a.beaten[1], a.reached[1]) + ' | ' + pct(a.beaten[2], a.reached[2]) + ' | ' + hpAt + ' | ' + tpr + ' | ' + (a.turns / N).toFixed(1) + ' | ' + (a.dmg / a.turns).toFixed(1) + ' |');
+      pct(a.beaten[1], a.reached[1]) + ' | ' + pct(a.beaten[2], a.reached[2]) + ' | ' + hpAt + ' | ' + tpr + ' | ' + (a.turns / N).toFixed(1) + ' | ' + (a.dmg / a.turns).toFixed(1) + ' | ' + oppD + ' |');
   }
 }
 
@@ -133,9 +139,11 @@ if (!COMPACT) {
   console.log('### 取った札・取られた札・出した札の内訳（「取らない」の行）');
   console.log('');
   for (const b of breakdown) {
-    console.log('- ' + b.c.no + ' ' + b.c.st.name);
+    const a = b.a;
+    console.log('- ' + b.c.no + ' ' + b.c.st.name + '（1 ターンあたり：相手の札 ' + (a.oppDmg / a.turns).toFixed(1) + '、固定 ' + (a.oppFixed / a.turns).toFixed(1) + '、相手の石 ' + (a.oppStone / a.turns).toFixed(1) + '　自分の回復 ' + (a.heal / a.turns).toFixed(1) + '、守りで減らした ' + (a.blocked / a.turns).toFixed(1) + '）');
     console.log('  - 自分が取った札: ' + dist(b.a.picks));
     console.log('  - 相手に取られた札: ' + dist(b.a.oppPicks));
     console.log('  - 出した札: ' + dist(b.a.playedCards));
   }
+}
 }

@@ -1,9 +1,12 @@
-/* ごみやま ルール部分。
+/* ごみやま ルール部分（試作2）。
  * ブラウザ（window.GomiRules）と Node（require）の両方で動く。画面のことは一切書かない。
  * 使い方：
  *   const s = GomiRules.createGame({ seed: 1 });
  *   const events = GomiRules.act(s, { type: 'pick', index: 0 });  // 状態 s は直接書き換わる
- * 相手（レア）がドラフトで取る札は、GomiRules.setOppPicker(fn) で差し込む（ai.js）。
+ * 相手（レア）の頭は差し込む（ai.js）：
+ *   setOppPicker(fn)    ドラフトで相手が取る札  fn(s) → { index, looked, lookedOpp, best }
+ *   setOppPlanner(fn)   相手の番に出す札の並び  fn(s) → [cardId, ...]（最大 playMax）
+ *   setOppDiscarder(fn) 相手の手札が上限のとき捨てる札 fn(s) → 手札の位置
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -11,38 +14,41 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  // ---------- 数値（仮。ボットの結果で調整する） ----------
+  // ---------- 数値（ボットの結果で調整する） ----------
   const CONF = {
-    playerHp: 30,   // 自分の体力
-    handMax: 7,     // 手札の上限
-    playMax: 3,     // 1 ターンに出せる枚数
-    pileBase: 5,    // ごみ山に見える枚数
-    pileMirror: 6,  // 2 枚目のレア（同じ枚数取る）のときの山
-    basePicks: 3,   // 自分が取れる枚数（レアを 1 枚持つごとに -1）
-    oppPicks: 2,    // 相手が取る枚数（2 枚目のレアは自分と同じ）
-    ownRare0Dmg: 3, // 1 枚目のレアを自分のものにしたとき、毎ターン始めの相手へのダメージ
-    ownRare1Pile: 1 // 2 枚目のレアを自分のものにしたとき、山に増える枚数
+    playerHp: 30,     // 自分の体力
+    handMax: 7,       // 自分の手札の上限
+    oppHandMax: 2,    // 相手の手札の上限（5 だと石ころをため込んで強すぎた。REPORT.md「数値の調整」）
+    playMax: 3,       // 1 ターンに出せる枚数（自分も相手も）
+    pileBase: 5,      // ごみ山に見える枚数
+    pileMirror: 6,    // 2 枚目のレア（同じ枚数取る）のときの山
+    basePicks: 3,     // 自分が取れる枚数（レアを 1 枚持つごとに -1）
+    oppPicks: 2,      // 相手が取る枚数（2 枚目のレアは自分と同じ）
+    ownRare0Dmg: 3,   // 1 枚目のレアを自分のものにしたとき、毎ターン始めの相手へのダメージ
+    ownRare1OppPicks: 1 // 2 枚目のレアを自分のものにしたとき、相手の取る枚数が減る数
   };
 
-  // 雑魚カード 8 種類
+  // 雑魚カード 8 種類（jp = 名前、text = 効果の文。向きが逆でも同じ文で読めるように「あいて」で書く）
   const CARDS = {
-    rat:    { id: 'rat',    jp: 'ネズミ',   base: 1 },             // 同じターンに出したネズミが増えるごとに +1
-    bat:    { id: 'bat',    jp: 'コウモリ', base: 2 },             // 手札に残っているコウモリ 1 枚ごとに +1
-    slime:  { id: 'slime',  jp: 'スライム', base: 1, heal: 2 },    // 自分の体力 +2
-    frog:   { id: 'frog',   jp: 'カエル',   base: 0, mult: 2 },    // 次に出す札のダメージ 2 倍（そのターン内）
-    mush:   { id: 'mush',   jp: 'キノコ',   base: 1, shield: 2 },  // 相手の次の攻撃を 2 減らす
-    goblin: { id: 'goblin', jp: 'ゴブリン', base: 3, selfDiscard: 1 }, // 出すと手札から 1 枚ランダムに捨てる
-    cat:    { id: 'cat',    jp: 'ネコ',     base: 0 },             // このターンに出した枚数（自分を含む）と同じダメージ
-    stone:  { id: 'stone',  jp: '石ころ',   base: 0, passive: 1 }  // 手札に持っていると毎ターン終わりに相手に 1 ダメージ
+    rat:    { id: 'rat',    jp: 'ねずみ',   base: 1, text: '1。このターンに出した ねずみ 1まいごとに +1' },
+    bat:    { id: 'bat',    jp: 'こうもり', base: 2, text: '2。手札にのこる こうもり 1まいごとに +1' },
+    slime:  { id: 'slime',  jp: 'スライム', base: 1, heal: 2, text: '1。じぶんの体力 +2' },
+    frog:   { id: 'frog',   jp: 'カエル',   base: 0, mult: 2, text: '0。つぎに出す札のダメージ 2ばい' },
+    mush:   { id: 'mush',   jp: 'キノコ',   base: 1, shield: 2, text: '1。あいての つぎのターンの攻撃を 2 へらす' },
+    goblin: { id: 'goblin', jp: 'ゴブリン', base: 3, selfDiscard: 1, text: '3。出したら じぶんの手札から 1まい すてる' },
+    cat:    { id: 'cat',    jp: 'ねこ',     base: 0, text: 'このターンに出した まい数と おなじダメージ' },
+    stone:  { id: 'stone',  jp: '石ころ',   base: 0, passive: 1, text: '出さずに手札にもつと、毎ターン あいてに 1' }
   };
   const CARD_IDS = Object.keys(CARDS);
 
-  // レアカード 3 枚（順番に出る）
-  // 指示の仮の数は 40/4, 50/3, 70/5 だったが、体力 30 が 3 戦持ち越しなので誰も勝てなかった（REPORT.md「数値の調整」）。
+  // レアカード 3 枚（順番に出る）。hp/atk はボットで決める（REPORT.md）。
   const RARES = [
-    { index: 0, jp: 'レア1', hp: 30, atk: 2, trait: 'none',   own: 'dmg3'  },
-    { index: 1, jp: 'レア2', hp: 35, atk: 2, trait: 'mirror', own: 'pile1' }, // mirror: 相手も自分と同じ枚数取る
-    { index: 2, jp: 'レア3', hp: 40, atk: 3, trait: 'hand5',  own: 'none'  }  // hand5: 自分の手札が 5 枚以上だと攻撃 +2
+    { index: 0, jp: 'あかおに',   hp: 22, atk: 0, trait: 'none',   own: 'dmg3',
+      text: 'とくちょう なし', ownText: 'もちものにすると：毎ターン はじめに あいてに 3' },
+    { index: 1, jp: 'ひとつめ',   hp: 27, atk: 0, trait: 'mirror', own: 'oppPicks',
+      text: 'ごみ山から じぶんと おなじ数 とる', ownText: 'もちものにすると：あいての とる数 -1' },
+    { index: 2, jp: 'きんのおう', hp: 32, atk: 0, trait: 'hand5',  own: 'none',
+      text: 'じぶんの手札が 5まい いじょうだと 攻撃 +2', ownText: '' }
   ];
 
   // ---------- 乱数（状態の中に持つので、同じ seed なら同じ展開になる） ----------
@@ -54,33 +60,37 @@
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   }
   function rndInt(s, n) { return Math.floor(rnd(s) * n); }
+  function count(arr, id) { let n = 0; for (let i = 0; i < arr.length; i++) if (arr[i] === id) n++; return n; }
 
-  // ---------- 相手の取り方（差し込み） ----------
-  let oppPicker = function randomPicker(s) {
-    const open = [];
-    s.pile.forEach((c, i) => { if (c) open.push(i); });
-    return { index: open[rndInt(s, open.length)], looked: [] };
+  // ---------- 相手の頭（差し込み。既定は弱い） ----------
+  let oppPicker = function (s) {
+    const open = []; s.pile.forEach(function (c, i) { if (c) open.push(i); });
+    return { index: open[rndInt(s, open.length)], looked: [], lookedOpp: [] };
   };
+  let oppPlanner = function () { return []; };
+  let oppDiscarder = function () { return 0; };
   function setOppPicker(fn) { oppPicker = fn; }
+  function setOppPlanner(fn) { oppPlanner = fn; }
+  function setOppDiscarder(fn) { oppDiscarder = fn; }
 
   // ---------- ゲームの作成 ----------
   function createGame(opts) {
     opts = opts || {};
     const seed = (opts.seed == null) ? (Math.random() * 0xffffffff) >>> 0 : opts.seed >>> 0;
     const s = {
-      seed: seed,
-      rngState: seed,
+      seed: seed, rngState: seed,
       turn: 0,
       phase: 'draft',          // draft | play | choose | win | lose
       player: { hp: CONF.playerHp, hand: [], shield: 0, owned: [] },
-      rareIndex: 0,
-      rare: null,
+      opp: { hand: [] },       // 相手（レア）の手札。レアが変わっても持ち越す
+      rareIndex: 0, rare: null,
       pile: [],
       draft: { order: [], step: 0 },
-      played: [],              // このターンに出した札
-      nextMult: 1,             // カエルの倍率（次に出す札に乗る）
-      turnDmg: 0,
-      totalDmg: 0
+      played: [], nextMult: 1,         // 自分がこのターンに出した札と、カエルの倍率
+      oppPlayed: [], oppMult: 1,       // 相手がこの番に出した札と、カエルの倍率
+      turnDmg: 0, totalDmg: 0,         // 自分が与えたダメージ
+      oppCardDmg: 0, oppFixedDmg: 0, oppStoneDmg: 0, oppTurns: 0, // 相手が与えたダメージの内訳と、相手の番の回数（ボットの統計用）
+      playerHeal: 0, playerBlocked: 0  // 自分の回復と守りで減らした分（ボットの統計用）
     };
     setRare(s, 0);
     const ev = [];
@@ -92,7 +102,7 @@
   function setRare(s, index) {
     const r = RARES[index];
     s.rareIndex = index;
-    s.rare = { index: index, hp: r.hp, maxHp: r.hp, atk: r.atk, trait: r.trait };
+    s.rare = { index: index, hp: r.hp, maxHp: r.hp, atk: r.atk, trait: r.trait, shield: 0 };
   }
 
   function draw(s, n) {
@@ -105,9 +115,9 @@
   function draftPlan(s) {
     const rare = s.rare;
     const pPicks = Math.max(0, CONF.basePicks - s.player.owned.length);
-    const oPicks = rare.trait === 'mirror' ? pPicks : CONF.oppPicks;
+    let oPicks = rare.trait === 'mirror' ? pPicks : CONF.oppPicks;
+    if (s.player.owned.indexOf(1) >= 0) oPicks = Math.max(0, oPicks - CONF.ownRare1OppPicks);
     let size = (rare.trait === 'mirror' ? CONF.pileMirror : CONF.pileBase);
-    if (s.player.owned.indexOf(1) >= 0) size += CONF.ownRare1Pile;
     size = Math.max(size, pPicks + oPicks);
     const order = [];
     let p = pPicks, o = oPicks;
@@ -118,18 +128,34 @@
     return { size: size, order: order, pPicks: pPicks, oPicks: oPicks };
   }
 
+  // 相手の守り（キノコ）で、相手へのダメージを減らす
+  function hitRare(s, dmg) {
+    const blocked = Math.min(dmg, s.rare.shield);
+    s.rare.shield -= blocked;
+    const real = dmg - blocked;
+    s.rare.hp -= real;
+    s.totalDmg += real;
+    return { dmg: real, blocked: blocked };
+  }
+  // 自分の守り（キノコ）で、自分へのダメージを減らす
+  function hitPlayer(s, dmg) {
+    const blocked = Math.min(dmg, s.player.shield);
+    s.player.shield -= blocked;
+    s.playerBlocked += blocked;
+    const real = dmg - blocked;
+    s.player.hp -= real;
+    return { dmg: real, blocked: blocked };
+  }
+
   function newTurn(s, ev) {
     s.turn++;
-    s.played = [];
-    s.nextMult = 1;
-    s.turnDmg = 0;
+    s.played = []; s.nextMult = 1; s.turnDmg = 0;
     s.player.shield = 0;
     ev.push({ t: 'turn', turn: s.turn });
     // 自分のものにしたレアの効果（ターン始め）
     if (s.player.owned.indexOf(0) >= 0) {
-      s.rare.hp -= CONF.ownRare0Dmg;
-      s.totalDmg += CONF.ownRare0Dmg;
-      ev.push({ t: 'own', rare: 0, dmg: CONF.ownRare0Dmg });
+      const h = hitRare(s, CONF.ownRare0Dmg);
+      ev.push({ t: 'own', rare: 0, dmg: h.dmg, blocked: h.blocked });
       if (s.rare.hp <= 0) { s.rare.hp = 0; rareDefeated(s, ev); return; }
     }
     const plan = draftPlan(s);
@@ -140,19 +166,26 @@
     runOpp(s, ev);
   }
 
-  // 相手の番が続く間、相手が取る
+  // 相手の番が続く間、相手が取る（手札が上限なら先に 1 枚捨てる）
   function runOpp(s, ev) {
     const d = s.draft;
     while (d.step < d.order.length && d.order[d.step] === 'o') {
+      if (s.opp.hand.length >= CONF.oppHandMax) {
+        let k = oppDiscarder(s);
+        if (!(k >= 0 && k < s.opp.hand.length)) k = 0;
+        const dc = s.opp.hand.splice(k, 1)[0];
+        ev.push({ t: 'oppDiscard', card: dc, handIndex: k, why: 'full' });
+      }
       const res = oppPicker(s) || {};
       let idx = res.index;
       if (idx == null || !s.pile[idx]) { // 念のため
-        const open = []; s.pile.forEach((c, i) => { if (c) open.push(i); });
+        const open = []; s.pile.forEach(function (c, i) { if (c) open.push(i); });
         idx = open[rndInt(s, open.length)];
       }
       const card = s.pile[idx];
       s.pile[idx] = null;
-      ev.push({ t: 'pick', who: 'o', index: idx, card: card, looked: res.looked || [], best: res.best !== false });
+      s.opp.hand.push(card);
+      ev.push({ t: 'pick', who: 'o', index: idx, card: card, looked: res.looked || [], lookedOpp: res.lookedOpp || [], best: res.best !== false });
       d.step++;
     }
     if (d.step >= d.order.length) endDraft(s, ev);
@@ -165,7 +198,7 @@
     ev.push({ t: 'draftEnd', left: left });
   }
 
-  // 札 1 枚のダメージ（倍率をかける前）。hand は出した後の手札、played はこのターンに出した札。
+  // 札 1 枚のダメージ（倍率をかける前）。hand は出した後の手札、played はこの番に出した札。
   function baseDamage(card, hand, played) {
     switch (card) {
       case 'rat':    return 1 + count(played, 'rat');
@@ -179,13 +212,12 @@
     }
     return 0;
   }
-  function count(arr, id) { let n = 0; for (let i = 0; i < arr.length; i++) if (arr[i] === id) n++; return n; }
 
   // 手札 hand から seq の順に出したときの見込み（ゴブリンの捨て札は無視）。ボットと相手の頭が使う。
-  function simulateSequence(hand, seq) {
+  function simulateSequence(hand, seq, played0, mult0) {
     const h = hand.slice();
-    const played = [];
-    let mult = 1, dmg = 0, heal = 0, shield = 0;
+    const played = (played0 || []).slice();
+    let mult = mult0 || 1, dmg = 0, heal = 0, shield = 0;
     for (let i = 0; i < seq.length; i++) {
       const c = seq[i];
       const k = h.indexOf(c);
@@ -252,10 +284,12 @@
     const card = s.player.hand.splice(handIndex, 1)[0];
     const mult = s.nextMult;
     s.nextMult = 1;
-    const dmg = baseDamage(card, s.player.hand, s.played) * mult;
+    const raw = baseDamage(card, s.player.hand, s.played) * mult;
     s.played.push(card);
-    const e = { t: 'play', card: card, dmg: dmg, chain: s.played.length, mult: mult, handIndex: handIndex, heal: 0, shield: 0 };
-    if (card === 'slime') { s.player.hp = Math.min(CONF.playerHp, s.player.hp + CARDS.slime.heal); e.heal = CARDS.slime.heal; }
+    const h = hitRare(s, raw);
+    s.turnDmg += h.dmg;
+    const e = { t: 'play', card: card, dmg: h.dmg, raw: raw, blocked: h.blocked, chain: s.played.length, mult: mult, handIndex: handIndex, heal: 0, shield: 0 };
+    if (card === 'slime') { const b = s.player.hp; s.player.hp = Math.min(CONF.playerHp, s.player.hp + CARDS.slime.heal); e.heal = CARDS.slime.heal; s.playerHeal += s.player.hp - b; }
     if (card === 'frog')  { s.nextMult = CARDS.frog.mult; }
     if (card === 'mush')  { s.player.shield += CARDS.mush.shield; e.shield = CARDS.mush.shield; }
     if (card === 'goblin' && s.player.hand.length > 0) {
@@ -263,33 +297,69 @@
       e.discarded = s.player.hand.splice(k, 1)[0];
       e.discardedIndex = k;
     }
-    s.rare.hp -= dmg;
-    s.turnDmg += dmg;
-    s.totalDmg += dmg;
     ev.push(e);
     if (s.rare.hp <= 0) { s.rare.hp = 0; rareDefeated(s, ev); }
     return true;
   }
 
+  // 相手が札を 1 枚出す（向きが逆：自分へのダメージ、レアの回復、相手の守り、相手の手札を捨てる）
+  function oppPlayCard(s, card, ev) {
+    const k = s.opp.hand.indexOf(card);
+    if (k < 0) return false;
+    s.opp.hand.splice(k, 1);
+    const mult = s.oppMult;
+    s.oppMult = 1;
+    const raw = baseDamage(card, s.opp.hand, s.oppPlayed) * mult;
+    s.oppPlayed.push(card);
+    const h = hitPlayer(s, raw);
+    s.oppCardDmg += h.dmg;
+    const e = { t: 'oppPlay', card: card, dmg: h.dmg, raw: raw, blocked: h.blocked, chain: s.oppPlayed.length, mult: mult, handIndex: k, heal: 0, shield: 0 };
+    if (card === 'slime') { const before = s.rare.hp; s.rare.hp = Math.min(s.rare.maxHp, s.rare.hp + CARDS.slime.heal); e.heal = s.rare.hp - before; }
+    if (card === 'frog')  { s.oppMult = CARDS.frog.mult; }
+    if (card === 'mush')  { s.rare.shield += CARDS.mush.shield; e.shield = CARDS.mush.shield; }
+    if (card === 'goblin' && s.opp.hand.length > 0) {
+      const g = rndInt(s, s.opp.hand.length);
+      e.discarded = s.opp.hand.splice(g, 1)[0];
+      e.discardedIndex = g;
+    }
+    ev.push(e);
+    return true;
+  }
+
   function endTurn(s, ev) {
     if (s.phase !== 'play') return false;
-    // 石ころ：手札にある分だけ 1 ダメージ
+    // 自分の石ころ：手札にある分だけ相手に 1
     const stones = count(s.player.hand, 'stone');
     if (stones > 0) {
-      s.rare.hp -= stones * CARDS.stone.passive;
-      s.totalDmg += stones * CARDS.stone.passive;
-      ev.push({ t: 'stone', count: stones, dmg: stones * CARDS.stone.passive });
+      const h = hitRare(s, stones * CARDS.stone.passive);
+      ev.push({ t: 'stone', count: stones, dmg: h.dmg, blocked: h.blocked });
       if (s.rare.hp <= 0) { s.rare.hp = 0; rareDefeated(s, ev); return true; }
     }
-    // 相手の攻撃
+    // ---- 相手の番 ----
+    s.phase = 'opp';
+    s.oppPlayed = []; s.oppMult = 1; s.rare.shield = 0; s.oppTurns++;
+    ev.push({ t: 'oppTurn' });
+    const seq = (oppPlanner(s) || []).slice(0, CONF.playMax);
+    for (let i = 0; i < seq.length; i++) {
+      if (s.oppPlayed.length >= CONF.playMax) break;
+      oppPlayCard(s, seq[i], ev);
+      if (s.player.hp <= 0) { s.player.hp = 0; s.phase = 'lose'; ev.push({ t: 'lose' }); return true; }
+    }
+    // 固定の攻撃
     let atk = s.rare.atk;
     if (s.rare.trait === 'hand5' && s.player.hand.length >= 5) atk += 2;
-    const blocked = Math.min(atk, s.player.shield);
-    const dmg = atk - blocked;
-    s.player.hp -= dmg;
-    s.player.shield = 0;
-    ev.push({ t: 'attack', atk: atk, blocked: blocked, dmg: dmg });
+    const a = hitPlayer(s, atk);
+    s.oppFixedDmg += a.dmg;
+    ev.push({ t: 'attack', atk: atk, blocked: a.blocked, dmg: a.dmg });
     if (s.player.hp <= 0) { s.player.hp = 0; s.phase = 'lose'; ev.push({ t: 'lose' }); return true; }
+    // 相手の石ころ
+    const os = count(s.opp.hand, 'stone');
+    if (os > 0) {
+      const h = hitPlayer(s, os * CARDS.stone.passive);
+      s.oppStoneDmg += h.dmg;
+      ev.push({ t: 'oppStone', count: os, dmg: h.dmg, blocked: h.blocked });
+      if (s.player.hp <= 0) { s.player.hp = 0; s.phase = 'lose'; ev.push({ t: 'lose' }); return true; }
+    }
     newTurn(s, ev);
     return true;
   }
@@ -328,6 +398,7 @@
     CONF: CONF, CARDS: CARDS, CARD_IDS: CARD_IDS, RARES: RARES,
     createGame: createGame, act: act, legal: legal,
     baseDamage: baseDamage, simulateSequence: simulateSequence, draftPlan: draftPlan,
-    rnd: rnd, rndInt: rndInt, count: count, setOppPicker: setOppPicker
+    rnd: rnd, rndInt: rndInt, count: count,
+    setOppPicker: setOppPicker, setOppPlanner: setOppPlanner, setOppDiscarder: setOppDiscarder
   };
 });
