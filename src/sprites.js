@@ -304,6 +304,26 @@
       '.k....k.',
       '..kkkk..'
     ],
+    point: [ // 指さす手（案内）
+      '...kk...',
+      '...kk...',
+      '...kk...',
+      '.kkkkkk.',
+      '.kkkkkkk',
+      '.kkkkkk.',
+      '..kkkk..',
+      '..kkkk..'
+    ],
+    dot: [ // ●
+      '..kkkk..',
+      '.kkkkkk.',
+      'kkkkkkkk',
+      'kkkkkkkk',
+      'kkkkkkkk',
+      'kkkkkkkk',
+      '.kkkkkk.',
+      '..kkkk..'
+    ],
     arrow: [ // → 次の札
       '....k...',
       '....kk..',
